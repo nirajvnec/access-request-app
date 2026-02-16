@@ -1,0 +1,21 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.log
+appsettings.Development.json
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.vs/
+.vscode/
+*.swp
+
+# Misc
+*.csx
+PLAN.md
