@@ -4,45 +4,45 @@ I have an Access Request Management System with Azure SQL. There are two platfor
 
 ---
 
-## Platform-Specific Tables (one set per platform)
+## Platform-Specific Tables
 
-### 1. UserAccessRequest_Databricks — Stores Databricks access requests
-- Id (INT, IDENTITY, PK)
-- Request_Id (UNIQUEIDENTIFIER, NOT NULL, UNIQUE)
-- Requestor_Email (VARCHAR, NOT NULL)
-- Expires_On (DATETIME, NOT NULL)
-- Status (VARCHAR, NOT NULL) — values: 'Active', 'Revoked'
+### IMPORTANT: The two primary tables already exist in the database with DIFFERENT schemas and column names. DO NOT create these tables — they already exist. Only create the child tables (ExpiryNotification, RevokedAccess) as new tables.
 
-### 2. UserAccessRequest_Palantir — Stores Palantir access requests
-- Id (INT, IDENTITY, PK)
-- Request_Id (UNIQUEIDENTIFIER, NOT NULL, UNIQUE)
-- Requestor_Email (VARCHAR, NOT NULL)
-- Expires_On (DATETIME, NOT NULL)
-- Status (VARCHAR, NOT NULL) — values: 'Active', 'Revoked'
+### 1. DataAccessDeltaRequests — Databricks access requests (ALREADY EXISTS — DO NOT CREATE)
+- id (INT, PK) — primary key
+- request_number, request_type, requested_by_ad_id, requested_by_email, requested_by, and other columns
+- This table already exists and is populated with data
+- The FK from child tables should reference `DataAccessDeltaRequests.id`
 
-### 3. ExpiryNotification_Databricks — Tracks notifications sent for expiring Databricks requests
+### 2. DataAccessPalantirRequests — Palantir access requests (ALREADY EXISTS — DO NOT CREATE)
+- RequestId (UNIQUEIDENTIFIER, PK) — primary key
+- ProjectId, ProjectRid, RequestType, Status, Justification, and other columns
+- This table already exists and is populated with data
+- The FK from child tables should reference `DataAccessPalantirRequests.RequestId`
+
+### 3. ExpiryNotification_Databricks — Tracks notifications sent for expiring Databricks requests (NEW — CREATE THIS)
 - Id (INT, IDENTITY, PK)
-- Request_Id (UNIQUEIDENTIFIER, FK → UserAccessRequest_Databricks.Request_Id)
+- DeltaRequestId (INT, FK → DataAccessDeltaRequests.id)
 - Notification_Sent_Dt (DATETIME)
 - Notification_Sent_To (VARCHAR)
 - Notification_Sent_By (VARCHAR)
 
-### 4. ExpiryNotification_Palantir — Tracks notifications sent for expiring Palantir requests
+### 4. ExpiryNotification_Palantir — Tracks notifications sent for expiring Palantir requests (NEW — CREATE THIS)
 - Id (INT, IDENTITY, PK)
-- Request_Id (UNIQUEIDENTIFIER, FK → UserAccessRequest_Palantir.Request_Id)
+- PalantirRequestId (UNIQUEIDENTIFIER, FK → DataAccessPalantirRequests.RequestId)
 - Notification_Sent_Dt (DATETIME)
 - Notification_Sent_To (VARCHAR)
 - Notification_Sent_By (VARCHAR)
 
-### 5. RevokedAccess_Databricks — Stores revocation details for Databricks requests
+### 5. RevokedAccess_Databricks — Stores revocation details for Databricks requests (NEW — CREATE THIS)
 - Id (INT, IDENTITY, PK)
-- Request_Id (UNIQUEIDENTIFIER, FK → UserAccessRequest_Databricks.Request_Id)
+- DeltaRequestId (INT, FK → DataAccessDeltaRequests.id)
 - Revoked_Dt (DATETIME, NOT NULL)
 - Revoked_By (VARCHAR(100), NOT NULL)
 
-### 6. RevokedAccess_Palantir — Stores revocation details for Palantir requests
+### 6. RevokedAccess_Palantir — Stores revocation details for Palantir requests (NEW — CREATE THIS)
 - Id (INT, IDENTITY, PK)
-- Request_Id (UNIQUEIDENTIFIER, FK → UserAccessRequest_Palantir.Request_Id)
+- PalantirRequestId (UNIQUEIDENTIFIER, FK → DataAccessPalantirRequests.RequestId)
 - Revoked_Dt (DATETIME, NOT NULL)
 - Revoked_By (VARCHAR(100), NOT NULL)
 
@@ -83,10 +83,10 @@ When the revoke job runs, it processes BOTH platforms in a single job run. It fi
 - This works across multiple servers because the lock lives in the database, not in-memory.
 
 ## Relationships
-- ExpiryNotification_Databricks.Request_Id → UserAccessRequest_Databricks.Request_Id (FK)
-- ExpiryNotification_Palantir.Request_Id → UserAccessRequest_Palantir.Request_Id (FK)
-- RevokedAccess_Databricks.Request_Id → UserAccessRequest_Databricks.Request_Id (FK)
-- RevokedAccess_Palantir.Request_Id → UserAccessRequest_Palantir.Request_Id (FK)
+- ExpiryNotification_Databricks.DeltaRequestId → DataAccessDeltaRequests.id (FK)
+- ExpiryNotification_Palantir.PalantirRequestId → DataAccessPalantirRequests.RequestId (FK)
+- RevokedAccess_Databricks.DeltaRequestId → DataAccessDeltaRequests.id (FK)
+- RevokedAccess_Palantir.PalantirRequestId → DataAccessPalantirRequests.RequestId (FK)
 - NotificationJobRun and RevokeExpiredJobRun are standalone (no FK relationships)
 
-Please generate the CREATE TABLE SQL scripts for all 8 tables in the correct order (respecting FK dependencies): primary tables first, then dependent tables, then standalone tables.
+Please generate the CREATE TABLE SQL scripts for the 6 NEW tables ONLY (do NOT create DataAccessDeltaRequests or DataAccessPalantirRequests — they already exist). Order: child tables first (ExpiryNotification, RevokedAccess), then standalone job tables.

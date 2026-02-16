@@ -10,10 +10,15 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 
 ## Database Tables (for context)
 
-**Per platform (Databricks & Palantir — same structure, different tables):**
-- `UserAccessRequest_Databricks` / `UserAccessRequest_Palantir` — Id, Request_Id, Requestor_Email, Expires_On, Status
-- `ExpiryNotification_Databricks` / `ExpiryNotification_Palantir` — Id, Request_Id (FK), Notification_Sent_Dt, Notification_Sent_To, Notification_Sent_By
-- `RevokedAccess_Databricks` / `RevokedAccess_Palantir` — Id, Request_Id (FK), Revoked_Dt, Revoked_By
+**Primary tables (ALREADY EXIST — different schemas, different column names):**
+- `DataAccessDeltaRequests` — Databricks requests. PK: `id` (INT). Columns include: request_number, request_type, requested_by_ad_id, requested_by_email, requested_by, and others.
+- `DataAccessPalantirRequests` — Palantir requests. PK: `RequestId` (UNIQUEIDENTIFIER). Columns include: ProjectId, ProjectRid, RequestType, Status, Justification, and others.
+
+**Child tables (NEW — one set per platform, with FK to parent):**
+- `ExpiryNotification_Databricks` — Id, DeltaRequestId (FK → DataAccessDeltaRequests.id), Notification_Sent_Dt, Notification_Sent_To, Notification_Sent_By
+- `ExpiryNotification_Palantir` — Id, PalantirRequestId (FK → DataAccessPalantirRequests.RequestId), Notification_Sent_Dt, Notification_Sent_To, Notification_Sent_By
+- `RevokedAccess_Databricks` — Id, DeltaRequestId (FK → DataAccessDeltaRequests.id), Revoked_Dt, Revoked_By
+- `RevokedAccess_Palantir` — Id, PalantirRequestId (FK → DataAccessPalantirRequests.RequestId), Revoked_Dt, Revoked_By
 
 **Shared (one table for both platforms):**
 - `NotificationJobRun` — Job_Id, Status, Started_At, Started_By, Completed_At, Success_Count, Failed_Count, Error_Message
@@ -45,16 +50,19 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 ### Notification-specific helper functions (in Program.cs or a separate helper file)
 
 5. `FindRequestsPendingNotificationAsync(SqlConnection connection, string platform)` — Queries the correct table based on platform parameter:
-   - If platform = "Databricks" → query `UserAccessRequest_Databricks` with subquery COUNT from `ExpiryNotification_Databricks`
-   - If platform = "Palantir" → query `UserAccessRequest_Palantir` with subquery COUNT from `ExpiryNotification_Palantir`
+   - If platform = "Databricks" → query `DataAccessDeltaRequests` with subquery COUNT from `ExpiryNotification_Databricks` (join on DeltaRequestId = id)
+   - If platform = "Palantir" → query `DataAccessPalantirRequests` with subquery COUNT from `ExpiryNotification_Palantir` (join on PalantirRequestId = RequestId)
+   - **NOTE:** The two primary tables have different column names. Map them to a common return structure.
+     - Databricks: `id` → Id, `requested_by_email` → Email
+     - Palantir: `RequestId` → Id, relevant email column → Email
    - SELECT Active requests expiring within 0–30 days, excluding never-expires (9999-12-31)
    - Returns List of tuples: (Id, RequestId, Email, ExpiresOn, DaysLeft, NotificationCount, Platform)
 
 6. `FilterRequestsNeedingNotification` — Business logic (same for both platforms): 0 sent → "30-Day Reminder", 1 sent AND daysLeft <= 7 → "7-Day Reminder", 2 sent → skip. Max 2 notifications per request.
 
 7. `SendSingleNotificationAsync(connectionString, requestId, email, expiresOn, daysLeft, notificationType, platform, ...)` — Simulates email with Task.Delay(10000ms), on success INSERTs into the correct notification table:
-   - If platform = "Databricks" → INSERT into `ExpiryNotification_Databricks`
-   - If platform = "Palantir" → INSERT into `ExpiryNotification_Palantir`
+   - If platform = "Databricks" → INSERT into `ExpiryNotification_Databricks` (DeltaRequestId = id)
+   - If platform = "Palantir" → INSERT into `ExpiryNotification_Palantir` (PalantirRequestId = RequestId)
    - Each task gets its own SqlConnection for thread safety.
 
 8. `ProcessNotificationsInParallelAsync` — Task.WhenAll with ConcurrentBag. Per-task try-catch. Returns (successes, failures, elapsedMs).
@@ -66,14 +74,14 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 ### Databricks Endpoints
 
 **GET /api/databricks/access-requests**
-- SELECT from `UserAccessRequest_Databricks` with LEFT JOIN to `RevokedAccess_Databricks`
+- SELECT from `DataAccessDeltaRequests` with LEFT JOIN to `RevokedAccess_Databricks` ON RevokedAccess_Databricks.DeltaRequestId = DataAccessDeltaRequests.id
 - Returns all Databricks requests with revoked info
 
 **GET /api/databricks/access-requests/pending-expiry**
-- SELECT from `UserAccessRequest_Databricks` WHERE Status = 'Active' AND Expires_On <= GETUTCDATE()
+- SELECT from `DataAccessDeltaRequests` WHERE expired (use the appropriate expiry/status columns from DataAccessDeltaRequests)
 
 **POST /api/databricks/access-requests**
-- Creates new request in `UserAccessRequest_Databricks`
+- Creates new request in `DataAccessDeltaRequests`
 - Body: { requestorEmail, expiryDays }
 - ExpiryDays > 0 → DateTime.UtcNow.AddDays(days), else → 9999-12-31 (never expires)
 
@@ -84,13 +92,13 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 ### Palantir Endpoints
 
 **GET /api/palantir/access-requests**
-- Same as Databricks but queries `UserAccessRequest_Palantir` LEFT JOIN `RevokedAccess_Palantir`
+- SELECT from `DataAccessPalantirRequests` with LEFT JOIN to `RevokedAccess_Palantir` ON RevokedAccess_Palantir.PalantirRequestId = DataAccessPalantirRequests.RequestId
 
 **GET /api/palantir/access-requests/pending-expiry**
-- Same as Databricks but queries `UserAccessRequest_Palantir`
+- SELECT from `DataAccessPalantirRequests` WHERE expired (use the appropriate expiry/status columns from DataAccessPalantirRequests)
 
 **POST /api/palantir/access-requests**
-- Creates new request in `UserAccessRequest_Palantir`
+- Creates new request in `DataAccessPalantirRequests`
 
 **GET /api/palantir/access-requests/pending-notifications**
 - Calls FindRequestsPendingNotificationAsync with platform = "Palantir"
@@ -113,10 +121,10 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 - Step 1: Acquire lock via RevokeJobHelper.TryAcquireLockAsync → 409 if locked
 - Step 2: Task.Delay(15000ms) artificial delay for testing
 - Step 3: Find expired requests from BOTH tables:
-  - Query `UserAccessRequest_Databricks` WHERE Status = 'Active' AND Expires_On <= GETUTCDATE()
-  - Query `UserAccessRequest_Palantir` WHERE Status = 'Active' AND Expires_On <= GETUTCDATE()
-- Step 4: For Databricks expired: UPDATE Status = 'Revoked' in `UserAccessRequest_Databricks`, INSERT into `RevokedAccess_Databricks`
-- Step 5: For Palantir expired: UPDATE Status = 'Revoked' in `UserAccessRequest_Palantir`, INSERT into `RevokedAccess_Palantir`
+  - Query `DataAccessDeltaRequests` for expired Databricks requests (use appropriate expiry/status columns)
+  - Query `DataAccessPalantirRequests` for expired Palantir requests (use appropriate expiry/status columns)
+- Step 4: For Databricks expired: UPDATE status in `DataAccessDeltaRequests`, INSERT into `RevokedAccess_Databricks` (DeltaRequestId = id)
+- Step 5: For Palantir expired: UPDATE status in `DataAccessPalantirRequests`, INSERT into `RevokedAccess_Palantir` (PalantirRequestId = RequestId)
 - Step 6: CompleteJobAsync with total revoked count (Databricks + Palantir)
 - Outer try-catch: FailJobAsync on crash
 

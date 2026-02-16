@@ -30,19 +30,27 @@ Finds all Active access requests expiring within 30 days from BOTH Databricks an
 
 **Step 2: Find requests that need notifications from BOTH platforms**
 - Open a separate SQL connection for the actual work
-- Query Databricks requests: SELECT from `UserAccessRequest_Databricks` with subquery COUNT from `ExpiryNotification_Databricks`. Tag each result with platform = "Databricks".
-- Query Palantir requests: SELECT from `UserAccessRequest_Palantir` with subquery COUNT from `ExpiryNotification_Palantir`. Tag each result with platform = "Palantir".
+- Query Databricks requests: SELECT from `DataAccessDeltaRequests` with subquery COUNT from `ExpiryNotification_Databricks` (join on DeltaRequestId = id). Tag each result with platform = "Databricks".
+- Query Palantir requests: SELECT from `DataAccessPalantirRequests` with subquery COUNT from `ExpiryNotification_Palantir` (join on PalantirRequestId = RequestId). Tag each result with platform = "Palantir".
+- **NOTE:** The two primary tables have DIFFERENT schemas and column names. Map them to a common return structure.
 - Merge both lists into a single combined list. Each item carries: (Id, RequestId, Email, ExpiresOn, DaysLeft, NotificationCount, Platform)
-- SQL pattern (run once per platform, substituting the table names):
+- SQL pattern for Databricks:
   ```sql
-  SELECT u.Id, u.Request_Id, u.Requestor_Email, u.Expires_On,
+  SELECT u.id, u.requested_by_email,
          DATEDIFF(DAY, GETUTCDATE(), u.Expires_On) AS DaysLeft,
-         (SELECT COUNT(*) FROM ExpiryNotification_Databricks en WHERE en.Request_Id = u.Request_Id) AS NotificationCount
-  FROM UserAccessRequest_Databricks u
+         (SELECT COUNT(*) FROM ExpiryNotification_Databricks en WHERE en.DeltaRequestId = u.id) AS NotificationCount
+  FROM DataAccessDeltaRequests u
   WHERE u.Status = 'Active'
     AND DATEDIFF(DAY, GETUTCDATE(), u.Expires_On) <= 30
     AND DATEDIFF(DAY, GETUTCDATE(), u.Expires_On) >= 0
     AND u.Expires_On < '9999-12-31'
+  ```
+- SQL pattern for Palantir (note different PK and column names):
+  ```sql
+  SELECT u.RequestId, /* map appropriate email/expiry columns */
+         (SELECT COUNT(*) FROM ExpiryNotification_Palantir en WHERE en.PalantirRequestId = u.RequestId) AS NotificationCount
+  FROM DataAccessPalantirRequests u
+  WHERE /* use appropriate status and expiry columns from DataAccessPalantirRequests */
   ```
 
 **Step 3: Filter — decide which notification type each request needs**
@@ -58,8 +66,8 @@ Finds all Active access requests expiring within 30 days from BOTH Databricks an
   a. Simulate email sending with `await Task.Delay(10000)` (10 second delay)
   b. Optionally simulate failure (for testing — see test simulation params below)
   c. If email succeeds → INSERT a record into the CORRECT platform's notification table:
-     - If platform = "Databricks" → INSERT into `ExpiryNotification_Databricks`
-     - If platform = "Palantir" → INSERT into `ExpiryNotification_Palantir`
+     - If platform = "Databricks" → INSERT into `ExpiryNotification_Databricks` (DeltaRequestId = DataAccessDeltaRequests.id)
+     - If platform = "Palantir" → INSERT into `ExpiryNotification_Palantir` (PalantirRequestId = DataAccessPalantirRequests.RequestId)
   d. If email fails → DO NOT insert into any notification table (only record successful sends)
 - **IMPORTANT: Each parallel task must get its own SqlConnection** (connections are not thread-safe)
 - **IMPORTANT: Each task is wrapped in its own try-catch** so one failure does NOT kill the other parallel tasks
@@ -98,20 +106,21 @@ Finds all Active access requests where the expiry date has already passed from B
 - `await Task.Delay(15000)` — 15 seconds so you can open a second browser tab to verify the lock works
 
 **Step 3: Find expired requests from BOTH platforms**
-- Query `UserAccessRequest_Databricks` WHERE Status = 'Active' AND Expires_On <= GETUTCDATE() → collect Request_Id values, tag as "Databricks"
-- Query `UserAccessRequest_Palantir` WHERE Status = 'Active' AND Expires_On <= GETUTCDATE() → collect Request_Id values, tag as "Palantir"
+- Query `DataAccessDeltaRequests` for expired Databricks requests (use appropriate status/expiry columns) → collect `id` values, tag as "Databricks"
+- Query `DataAccessPalantirRequests` for expired Palantir requests (use appropriate status/expiry columns) → collect `RequestId` values, tag as "Palantir"
+- **NOTE:** The two tables have different PKs: Databricks uses `id` (INT), Palantir uses `RequestId` (UNIQUEIDENTIFIER)
 
 **Step 4: If no expired requests found in either platform**
 - Release the lock (mark as Completed with Revoked_Count = 0)
 - Return "No expired requests found to revoke."
 
 **Step 5: Revoke expired Databricks requests**
-- UPDATE `UserAccessRequest_Databricks` SET Status = 'Revoked' WHERE Status = 'Active' AND Expires_On <= GETUTCDATE()
-- For each Databricks expired Request_Id → INSERT into `RevokedAccess_Databricks` with Revoked_Dt = GETUTCDATE() and Revoked_By = 'System - Scheduled Expiry Job'
+- UPDATE `DataAccessDeltaRequests` SET Status = 'Revoked' WHERE expired (use appropriate columns)
+- For each Databricks expired `id` → INSERT into `RevokedAccess_Databricks` (DeltaRequestId = id) with Revoked_Dt = GETUTCDATE() and Revoked_By = 'System - Scheduled Expiry Job'
 
 **Step 6: Revoke expired Palantir requests**
-- UPDATE `UserAccessRequest_Palantir` SET Status = 'Revoked' WHERE Status = 'Active' AND Expires_On <= GETUTCDATE()
-- For each Palantir expired Request_Id → INSERT into `RevokedAccess_Palantir` with Revoked_Dt = GETUTCDATE() and Revoked_By = 'System - Scheduled Expiry Job'
+- UPDATE `DataAccessPalantirRequests` SET Status = 'Revoked' WHERE expired (use appropriate columns)
+- For each Palantir expired `RequestId` → INSERT into `RevokedAccess_Palantir` (PalantirRequestId = RequestId) with Revoked_Dt = GETUTCDATE() and Revoked_By = 'System - Scheduled Expiry Job'
 
 **Step 7: Release the lock**
 - On success: UPDATE RevokeExpiredJobRun to Completed with total Revoked_Count (Databricks count + Palantir count)
@@ -165,13 +174,13 @@ Finds all Active access requests where the expiry date has already passed from B
 
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
-| GET | /api/databricks/access-requests | All Databricks requests with LEFT JOIN to RevokedAccess_Databricks |
-| GET | /api/databricks/access-requests/pending-expiry | Databricks active requests past expiry |
-| POST | /api/databricks/access-requests | Create new Databricks request |
+| GET | /api/databricks/access-requests | All Databricks requests (DataAccessDeltaRequests LEFT JOIN RevokedAccess_Databricks) |
+| GET | /api/databricks/access-requests/pending-expiry | Databricks expired requests from DataAccessDeltaRequests |
+| POST | /api/databricks/access-requests | Create new request in DataAccessDeltaRequests |
 | GET | /api/databricks/access-requests/pending-notifications | Databricks requests needing notification |
-| GET | /api/palantir/access-requests | All Palantir requests with LEFT JOIN to RevokedAccess_Palantir |
-| GET | /api/palantir/access-requests/pending-expiry | Palantir active requests past expiry |
-| POST | /api/palantir/access-requests | Create new Palantir request |
+| GET | /api/palantir/access-requests | All Palantir requests (DataAccessPalantirRequests LEFT JOIN RevokedAccess_Palantir) |
+| GET | /api/palantir/access-requests/pending-expiry | Palantir expired requests from DataAccessPalantirRequests |
+| POST | /api/palantir/access-requests | Create new request in DataAccessPalantirRequests |
 | GET | /api/palantir/access-requests/pending-notifications | Palantir requests needing notification |
 | POST | /api/access-requests/send-expiry-notifications | Run notification job — processes BOTH platforms (with DB lock) |
 | GET | /api/access-requests/notification-job-status | Check notification job lock status |
