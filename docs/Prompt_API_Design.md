@@ -1,6 +1,6 @@
 # API Design Prompt
 
-I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for an Access Request Management System. Here is the complete API design. Please implement all endpoints and frontend pages.
+I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for an Access Request Management System. There are two platforms — **Databricks** and **Palantir** — each with their own tables. The API should handle both platforms. Please implement all endpoints and frontend pages.
 
 **Tech stack:** ASP.NET Core Minimal APIs, Microsoft.Data.SqlClient (raw SQL, no EF), React 19, TypeScript, Azure SQL.
 
@@ -8,75 +8,119 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 
 ---
 
+## Database Tables (for context)
+
+**Per platform (Databricks & Palantir — same structure, different tables):**
+- `UserAccessRequest_Databricks` / `UserAccessRequest_Palantir` — Id, Request_Id, Requestor_Email, Expires_On, Status
+- `ExpiryNotification_Databricks` / `ExpiryNotification_Palantir` — Id, Request_Id (FK), Notification_Sent_Dt, Notification_Sent_To, Notification_Sent_By
+- `RevokedAccess_Databricks` / `RevokedAccess_Palantir` — Id, Request_Id (FK), Revoked_Dt, Revoked_By
+
+**Shared (one table for both platforms):**
+- `NotificationJobRun` — Job_Id, Status, Started_At, Started_By, Completed_At, Success_Count, Failed_Count, Error_Message
+- `RevokeExpiredJobRun` — Job_Id, Status, Started_At, Started_By, Completed_At, Revoked_Count, Error_Message
+
+---
+
 ## Backend Structure
 
 ### Models (in Models/ folder)
-- **UserAccessRequest** — Id, RequestId (Guid), RequestorEmail, ExpiresOn, Status
-- **RevokedAccess** — Id, RequestId (Guid), RevokedDt, RevokedBy
-- **CreateAccessRequest** — RequestorEmail (string), ExpiryDays (int)
+- **UserAccessRequest** — Id, RequestId (Guid), RequestorEmail, ExpiresOn, Status (used for both platforms)
+- **RevokedAccess** — Id, RequestId (Guid), RevokedDt, RevokedBy (used for both platforms)
+- **CreateAccessRequest** — RequestorEmail (string), ExpiryDays (int), Platform (string — "Databricks" or "Palantir")
 
 ### Helper Classes (in Helpers/ folder)
 
+**NotificationJobHelper.cs** — Static class with 4 methods for DB-level locking on the NotificationJobRun table:
+1. `TryAcquireLockAsync(SqlConnection, Guid jobId, string startedBy)` → bool
+2. `GetActiveJobInfoAsync(SqlConnection)` → object?
+3. `CompleteJobAsync(SqlConnection, Guid jobId, int successCount, int failedCount)` → void
+4. `FailJobAsync(SqlConnection, Guid jobId, string errorMessage)` → void
+
 **RevokeJobHelper.cs** — Static class with 4 methods for DB-level locking on the RevokeExpiredJobRun table:
-1. `TryAcquireLockAsync(SqlConnection, Guid jobId, string startedBy)` → bool — Atomic INSERT with NOT EXISTS, 10-min stale timeout
-2. `GetActiveJobInfoAsync(SqlConnection)` → object? — SELECT TOP 1 InProgress job within 10 min
-3. `CompleteJobAsync(SqlConnection, Guid jobId, int revokedCount)` → void — UPDATE to Completed
-4. `FailJobAsync(SqlConnection, Guid jobId, string errorMessage)` → void — UPDATE to Failed
+1. `TryAcquireLockAsync(SqlConnection, Guid jobId, string startedBy)` → bool
+2. `GetActiveJobInfoAsync(SqlConnection)` → object?
+3. `CompleteJobAsync(SqlConnection, Guid jobId, int revokedCount)` → void
+4. `FailJobAsync(SqlConnection, Guid jobId, string errorMessage)` → void
 
-### Helper Functions (inline in Program.cs for notification job)
-Same 4-function pattern but for NotificationJobRun table:
-1. `TryAcquireJobLockAsync` — INSERT with NOT EXISTS on NotificationJobRun
-2. `GetActiveJobInfoAsync` — SELECT TOP 1 InProgress from NotificationJobRun
-3. `CompleteJobAsync` — UPDATE NotificationJobRun to Completed with Success_Count, Failed_Count
-4. `FailJobAsync` — UPDATE NotificationJobRun to Failed with Error_Message
+### Notification-specific helper functions (in Program.cs or a separate helper file)
 
-Plus notification-specific helpers:
-5. `FindRequestsPendingNotificationAsync` — SELECT Active requests expiring within 30 days (and >= 0 days), excluding never-expires (9999-12-31), with subquery COUNT of ExpiryNotification per Request_Id. Returns List of tuples: (Id, RequestId, Email, ExpiresOn, DaysLeft, NotificationCount)
-6. `FilterRequestsNeedingNotification` — Business logic: 0 notifications sent → "30-Day Reminder", 1 sent AND daysLeft <= 7 → "7-Day Reminder", 2 sent → skip. Max 2 notifications per request.
-7. `SendSingleNotificationAsync` — Simulates email with Task.Delay(10000ms), supports failure simulation (?simulateFailures=true for random ~50%, ?failEmail=x@test.com for specific), on success INSERTs into ExpiryNotification. Each task gets its own SqlConnection for thread safety.
-8. `ProcessNotificationsInParallelAsync` — Task.WhenAll with ConcurrentBag for thread-safe collection. Per-task try-catch so one failure doesn't kill others. Returns (successes, failures, elapsedMs).
+5. `FindRequestsPendingNotificationAsync(SqlConnection connection, string platform)` — Queries the correct table based on platform parameter:
+   - If platform = "Databricks" → query `UserAccessRequest_Databricks` with subquery COUNT from `ExpiryNotification_Databricks`
+   - If platform = "Palantir" → query `UserAccessRequest_Palantir` with subquery COUNT from `ExpiryNotification_Palantir`
+   - SELECT Active requests expiring within 0–30 days, excluding never-expires (9999-12-31)
+   - Returns List of tuples: (Id, RequestId, Email, ExpiresOn, DaysLeft, NotificationCount, Platform)
+
+6. `FilterRequestsNeedingNotification` — Business logic (same for both platforms): 0 sent → "30-Day Reminder", 1 sent AND daysLeft <= 7 → "7-Day Reminder", 2 sent → skip. Max 2 notifications per request.
+
+7. `SendSingleNotificationAsync(connectionString, requestId, email, expiresOn, daysLeft, notificationType, platform, ...)` — Simulates email with Task.Delay(10000ms), on success INSERTs into the correct notification table:
+   - If platform = "Databricks" → INSERT into `ExpiryNotification_Databricks`
+   - If platform = "Palantir" → INSERT into `ExpiryNotification_Palantir`
+   - Each task gets its own SqlConnection for thread safety.
+
+8. `ProcessNotificationsInParallelAsync` — Task.WhenAll with ConcurrentBag. Per-task try-catch. Returns (successes, failures, elapsedMs).
 
 ---
 
 ## API Endpoints
 
-### GET /api/access-requests
-- SELECT with LEFT JOIN to RevokedAccess to include revokedDt, revokedBy (null for non-revoked)
-- Returns all requests with revoked info
+### Databricks Endpoints
 
-### GET /api/access-requests/pending-expiry
-- SELECT Active requests WHERE Expires_On <= GETUTCDATE()
-- Returns list of overdue but still Active requests
+**GET /api/databricks/access-requests**
+- SELECT from `UserAccessRequest_Databricks` with LEFT JOIN to `RevokedAccess_Databricks`
+- Returns all Databricks requests with revoked info
 
-### POST /api/access-requests
-- Creates new request with Guid.NewGuid() for Request_Id
+**GET /api/databricks/access-requests/pending-expiry**
+- SELECT from `UserAccessRequest_Databricks` WHERE Status = 'Active' AND Expires_On <= GETUTCDATE()
+
+**POST /api/databricks/access-requests**
+- Creates new request in `UserAccessRequest_Databricks`
+- Body: { requestorEmail, expiryDays }
 - ExpiryDays > 0 → DateTime.UtcNow.AddDays(days), else → 9999-12-31 (never expires)
-- Status = 'Active'
 
-### POST /api/access-requests/revoke-expired (with DB lock)
-- Step 1: Acquire lock via RevokeJobHelper.TryAcquireLockAsync → if fails, return 409 Conflict with active job info
-- Step 2: Task.Delay(15000ms) artificial delay for testing, then:
-  - Find all Active requests where Expires_On <= GETUTCDATE()
-  - UPDATE Status = 'Revoked' in UserAccessRequest
-  - INSERT into RevokedAccess for each (with GETUTCDATE() and "System - Scheduled Expiry Job")
-- Step 3: CompleteJobAsync with revoked count
-- Outer try-catch: FailJobAsync on crash
+**GET /api/databricks/access-requests/pending-notifications**
+- Calls FindRequestsPendingNotificationAsync with platform = "Databricks"
+- Returns Databricks requests needing notification
 
-### GET /api/access-requests/revoke-job-status
+### Palantir Endpoints
+
+**GET /api/palantir/access-requests**
+- Same as Databricks but queries `UserAccessRequest_Palantir` LEFT JOIN `RevokedAccess_Palantir`
+
+**GET /api/palantir/access-requests/pending-expiry**
+- Same as Databricks but queries `UserAccessRequest_Palantir`
+
+**POST /api/palantir/access-requests**
+- Creates new request in `UserAccessRequest_Palantir`
+
+**GET /api/palantir/access-requests/pending-notifications**
+- Calls FindRequestsPendingNotificationAsync with platform = "Palantir"
+
+### Shared Job Endpoints (process BOTH platforms in one job run)
+
+**POST /api/access-requests/send-expiry-notifications** (with DB lock)
+- Query params: ?simulateFailures=true, ?failEmail=email1&failEmail=email2
+- Step 1: Acquire lock via NotificationJobHelper.TryAcquireLockAsync → 409 if locked
+- Step 2: Call FindRequestsPendingNotificationAsync TWICE — once for "Databricks", once for "Palantir". Merge the results into a single list (each item carries its platform).
+- Step 3: FilterRequestsNeedingNotification on the merged list
+- Step 4: ProcessNotificationsInParallelAsync — sends all in parallel, each notification inserts into the correct platform table based on the platform field
+- Step 5: CompleteJobAsync with total success/failure counts across both platforms
+- Response includes: message, jobId, notifiedCount, failedCount, requests[], failed[], performance metrics
+
+**GET /api/access-requests/notification-job-status**
 - Returns { isLocked: bool, activeJob: { jobId, startedAt, startedBy } | null }
 
-### POST /api/access-requests/send-expiry-notifications (with DB lock)
-- Query params: ?simulateFailures=true, ?failEmail=email1&failEmail=email2
-- Step 1: Acquire lock via TryAcquireJobLockAsync → 409 if locked
-- Step 2: FindRequestsPendingNotificationAsync → FilterRequestsNeedingNotification → ProcessNotificationsInParallelAsync
-- Step 3: CompleteJobAsync with success/failure counts
-- Response includes: message, jobId, notifiedCount, failedCount, requests[], failed[], performance { parallelElapsedMs, sequentialEstimateMs, totalElapsedMs, savedMs, emailDelayMs }
+**POST /api/access-requests/revoke-expired** (with DB lock)
+- Step 1: Acquire lock via RevokeJobHelper.TryAcquireLockAsync → 409 if locked
+- Step 2: Task.Delay(15000ms) artificial delay for testing
+- Step 3: Find expired requests from BOTH tables:
+  - Query `UserAccessRequest_Databricks` WHERE Status = 'Active' AND Expires_On <= GETUTCDATE()
+  - Query `UserAccessRequest_Palantir` WHERE Status = 'Active' AND Expires_On <= GETUTCDATE()
+- Step 4: For Databricks expired: UPDATE Status = 'Revoked' in `UserAccessRequest_Databricks`, INSERT into `RevokedAccess_Databricks`
+- Step 5: For Palantir expired: UPDATE Status = 'Revoked' in `UserAccessRequest_Palantir`, INSERT into `RevokedAccess_Palantir`
+- Step 6: CompleteJobAsync with total revoked count (Databricks + Palantir)
+- Outer try-catch: FailJobAsync on crash
 
-### GET /api/access-requests/pending-notifications
-- Reuses FindRequestsPendingNotificationAsync + filtering logic
-- Returns list with: id, requestId, requestorEmail, expiresOn, daysLeft, notificationsSent, nextNotification
-
-### GET /api/access-requests/notification-job-status
+**GET /api/access-requests/revoke-job-status**
 - Returns { isLocked: bool, activeJob: { jobId, startedAt, startedBy } | null }
 
 ---
@@ -86,44 +130,58 @@ Plus notification-specific helpers:
 ### types.ts
 ```typescript
 export interface AccessRequest {
-  id: number; requestId: string; requestorEmail: string; expiresOn: string; status: string;
-  revokedDt?: string | null; revokedBy?: string | null;
+  id: number
+  requestId: string
+  requestorEmail: string
+  expiresOn: string
+  status: string
+  platform: string  // "Databricks" or "Palantir"
+  revokedDt?: string | null
+  revokedBy?: string | null
 }
 ```
 
-### AllRequests.tsx
-- Fetches GET /api/access-requests
+### Navigation
+The app should have a sidebar or tab navigation that lets the user switch between Databricks and Palantir views. Each platform has its own pages for:
+- All Requests
+- Create Request
+- Pending Expiry
+
+The job pages (Expiry Notifications, Revoke Expired) are shared — they show data from BOTH platforms and process both in a single job.
+
+### DatabricksAllRequests.tsx / PalantirAllRequests.tsx
+- Same component logic, different API endpoint (/api/databricks/... vs /api/palantir/...)
 - Table with columns: ID, Request ID, Requestor Email, Expires On, Status, Revoked Info
-- Revoked rows highlighted with expired-row class, badge shows "Revoked" in grey
-- Revoked Info shows date + "by whom", or "—" for non-revoked
+- Consider making a reusable `AllRequestsPage` component that takes a `platform` prop
 
-### CreateRequest.tsx
-- Form with email input and dropdown for expiry duration
-- Dropdown includes test options: 1 Day, 5 Days, 29 Days, plus standard 30/60/90/365/Never
+### DatabricksCreateRequest.tsx / PalantirCreateRequest.tsx
+- Same form, posts to different endpoint
+- Consider a reusable `CreateRequestPage` component with `platform` prop
 
-### PendingExpiry.tsx
-- Fetches GET /api/access-requests/pending-expiry
-- Table showing overdue Active requests
+### DatabricksPendingExpiry.tsx / PalantirPendingExpiry.tsx
+- Same component logic, different API endpoint
 
-### RevokeExpired.tsx
-- Fetches and displays expired requests table from /pending-expiry on load
-- Shows count: "3 Expired Request(s) Found"
-- Button: "Run Revoke Job (3)" — disabled when no expired requests or job is locked
-- **DB lock with polling:** On mount, checks GET /revoke-job-status. If locked, polls every 3 seconds. Shows yellow banner: "Revoke job is currently running — Started by {server} at {time}". Button shows "Job Running — Please Wait" (disabled).
-- Handles 409 Conflict response
-- After job completes: refreshes expired list (should be empty), shows success result card
+### RevokeExpired.tsx (SHARED — processes both platforms)
+- Fetches expired requests from BOTH /api/databricks/access-requests/pending-expiry AND /api/palantir/access-requests/pending-expiry
+- Shows a combined table with an extra "Platform" column showing "Databricks" or "Palantir" badge
+- Shows count: "5 Expired Request(s) Found (3 Databricks, 2 Palantir)"
+- Button: "Run Revoke Job (5)" — triggers the shared /api/access-requests/revoke-expired endpoint
+- DB lock with polling on /api/access-requests/revoke-job-status
+- After job completes: refreshes both lists
 
-### ExpiryNotifications.tsx
-- Fetches pending notifications from /pending-notifications
-- Table with: ID, Request ID, Email, Expires On, Days Left, Sent (x/2), Next Notification
-- **Test Mode UI:** Radio buttons — Normal, Random failures (~50%), Pick emails to fail (clickable email buttons toggle pass/fail)
-- Button: "Trigger Notification to All (N)" with TEST MODE badge
-- **DB lock with polling:** Same pattern as RevokeExpired — checks /notification-job-status, polls every 3s, yellow banner, disabled button, 409 handling
-- **Results display:** Success/failure sections with badges, performance metrics card (parallel vs sequential time, time saved)
+### ExpiryNotifications.tsx (SHARED — processes both platforms)
+- Fetches pending notifications from BOTH /api/databricks/access-requests/pending-notifications AND /api/palantir/access-requests/pending-notifications
+- Shows a combined table with "Platform" column
+- Test Mode UI: radio buttons (Normal, Random failures, Pick emails to fail)
+- Button: "Trigger Notification to All (N)" — triggers the shared /api/access-requests/send-expiry-notifications
+- DB lock with polling on /api/access-requests/notification-job-status
+- Results display with platform badges on each notification result
 
 ### Shared CSS patterns:
-- `.job-locked-banner` — Yellow border with pulse animation, ⚠️ icon, server name and time
+- `.job-locked-banner` — Yellow border with pulse animation
 - `.badge.active/.warning/.expired/.revoked` — Color-coded status badges
+- `.badge.databricks` — Blue/purple badge for Databricks platform
+- `.badge.palantir` — Teal/green badge for Palantir platform
 - `.result-card.result-success/.result-info/.result-error` — Result display cards
 - `.test-controls/.test-options/.pick-emails` — Test mode UI styling
 - `.performance-card/.performance-grid` — Metrics display
