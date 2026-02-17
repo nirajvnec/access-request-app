@@ -1,40 +1,53 @@
 # Implementation Flow Prompt
 
-I need you to implement a job execution system for an Access Request Management application. There are two platforms — **Databricks** and **Palantir** — each with their own database tables. There are two shared jobs: **Send Expiry Notifications** and **Revoke Expired Access**. Both jobs process BOTH platforms in a single run and use the same DB-level locking pattern to prevent concurrent runs across multiple servers.
+I need you to implement a job execution system for an Access Request Management application. There are two platforms — **Databricks** and **Palantir** — each with their own database tables. There are 4 independent jobs (one per platform per job type), all tracked in a single unified `JobRun` table using a `Job_Type` column. Each job only processes its own platform. All 4 jobs can run in parallel because the DB lock is scoped by `Job_Type`.
+
+**The 4 job types:**
+| Job_Type | What it does |
+|----------|-------------|
+| `ExpiryNotificationDatabricks` | Sends expiry notifications for Databricks requests |
+| `ExpiryNotificationPalantir` | Sends expiry notifications for Palantir requests |
+| `RevokeExpiredDatabricks` | Revokes expired Databricks access |
+| `RevokeExpiredPalantir` | Revokes expired Palantir access |
+
+**Single helper class:** `JobRunHelper.cs` — all 4 methods take a `jobType` parameter to scope the lock:
+1. `TryAcquireLockAsync(SqlConnection, Guid jobId, string jobType, string startedBy)` → bool
+2. `GetActiveJobInfoAsync(SqlConnection, string jobType)` → object?
+3. `CompleteJobAsync(SqlConnection, Guid jobId, int processedCount, int failedCount)` → void
+4. `FailJobAsync(SqlConnection, Guid jobId, string errorMessage)` → void
 
 ---
 
-## Flow 1: Send Expiry Notifications Job
+## Flow 1: Send Expiry Notifications Job (per-platform)
 
 ### What it does
-Finds all Active access requests expiring within 30 days from BOTH Databricks and Palantir tables, sends email notifications (simulated with artificial delay) in parallel, and records each successful notification in the correct platform's notification table. Each request gets at most 2 notifications: a 30-Day Reminder and a 7-Day Reminder.
+Each platform has its own notification job (Job_Type: `ExpiryNotificationDatabricks` or `ExpiryNotificationPalantir`). It finds Active access requests expiring within 30 days from that platform's table only, sends email notifications (simulated with artificial delay) in parallel, and records each successful notification in that platform's notification table. Each request gets at most 2 notifications: a 30-Day Reminder and a 7-Day Reminder.
 
-### Step-by-step execution flow
+### Step-by-step execution flow (parameterized by platform)
 
-**Step 1: Check if another job is already running (DB-level lock)**
+The endpoint receives a platform context from the URL (e.g., `/api/databricks/...` vs `/api/palantir/...`). The flow is identical for both — only the table names, PK columns, and Job_Type differ.
+
+**Step 1: Check if another job of the SAME TYPE is already running (DB-level lock)**
 - Open a SQL connection (call this `lockConnection` — keep it open for the entire job lifecycle)
-- Try to INSERT a new row into `NotificationJobRun` table with Status = 'InProgress'
-- The INSERT uses a WHERE NOT EXISTS clause: only insert if there is NO existing row with Status = 'InProgress' that was started within the last 10 minutes (stale job timeout for crashed processes)
-- SQL pattern:
+- Call `JobRunHelper.TryAcquireLockAsync(connection, jobId, jobType, startedBy)` where jobType = `"ExpiryNotificationDatabricks"` or `"ExpiryNotificationPalantir"`
+- SQL pattern (inside JobRunHelper):
   ```sql
-  INSERT INTO NotificationJobRun (Job_Id, Status, Started_At, Started_By)
-  SELECT @JobId, 'InProgress', GETUTCDATE(), @StartedBy
+  INSERT INTO JobRun (Job_Id, Job_Type, Status, Started_At, Started_By)
+  SELECT @JobId, @JobType, 'InProgress', GETUTCDATE(), @StartedBy
   WHERE NOT EXISTS (
-      SELECT 1 FROM NotificationJobRun
-      WHERE Status = 'InProgress'
+      SELECT 1 FROM JobRun
+      WHERE Job_Type = @JobType
+        AND Status = 'InProgress'
         AND DATEDIFF(MINUTE, Started_At, GETUTCDATE()) <= 10
   )
   ```
 - If rowsAffected > 0 → Lock acquired, proceed to Step 2
-- If rowsAffected = 0 → Another job is running. Query the active job details and return HTTP 409 Conflict with the active job info (jobId, startedAt, startedBy)
+- If rowsAffected = 0 → Another job of the same type is running. Query the active job details and return HTTP 409 Conflict
+- **NOTE:** A Databricks notification job does NOT block a Palantir notification job — they have different Job_Type values
 
-**Step 2: Find requests that need notifications from BOTH platforms**
+**Step 2: Find requests that need notifications from THIS platform only**
 - Open a separate SQL connection for the actual work
-- Query Databricks requests: SELECT from `DataAccessDeltaRequests` with subquery COUNT from `ExpiryNotification_Databricks` (join on DeltaRequestId = id). Tag each result with platform = "Databricks".
-- Query Palantir requests: SELECT from `DataAccessPalantirRequests` with subquery COUNT from `ExpiryNotification_Palantir` (join on PalantirRequestId = RequestId). Tag each result with platform = "Palantir".
-- **NOTE:** The two primary tables have DIFFERENT schemas and column names. Map them to a common return structure.
-- Merge both lists into a single combined list. Each item carries: (Id, RequestId, Email, ExpiresOn, DaysLeft, NotificationCount, Platform)
-- SQL pattern for Databricks:
+- For Databricks (Job_Type = `ExpiryNotificationDatabricks`):
   ```sql
   SELECT u.id, u.requested_by_email,
          DATEDIFF(DAY, GETUTCDATE(), u.Expires_On) AS DaysLeft,
@@ -45,7 +58,7 @@ Finds all Active access requests expiring within 30 days from BOTH Databricks an
     AND DATEDIFF(DAY, GETUTCDATE(), u.Expires_On) >= 0
     AND u.Expires_On < '9999-12-31'
   ```
-- SQL pattern for Palantir (note different PK and column names):
+- For Palantir (Job_Type = `ExpiryNotificationPalantir`) — note different PK and column names:
   ```sql
   SELECT u.RequestId, /* map appropriate email/expiry columns */
          (SELECT COUNT(*) FROM ExpiryNotification_Palantir en WHERE en.PalantirRequestId = u.RequestId) AS NotificationCount
@@ -58,29 +71,28 @@ Finds all Active access requests expiring within 30 days from BOTH Databricks an
 - NotificationCount = 1 AND DaysLeft <= 7 → Send "7-Day Reminder"
 - NotificationCount = 2 → Skip (already got both reminders)
 - NotificationCount = 1 AND DaysLeft > 7 → Skip (not yet in 7-day window)
-- This logic is the same for both platforms
 
 **Step 4: Send notifications in PARALLEL using Task.WhenAll**
 - For each request that needs a notification, create an async task
 - Each task does the following:
   a. Simulate email sending with `await Task.Delay(10000)` (10 second delay)
   b. Optionally simulate failure (for testing — see test simulation params below)
-  c. If email succeeds → INSERT a record into the CORRECT platform's notification table:
-     - If platform = "Databricks" → INSERT into `ExpiryNotification_Databricks` (DeltaRequestId = DataAccessDeltaRequests.id)
-     - If platform = "Palantir" → INSERT into `ExpiryNotification_Palantir` (PalantirRequestId = DataAccessPalantirRequests.RequestId)
-  d. If email fails → DO NOT insert into any notification table (only record successful sends)
+  c. If email succeeds → INSERT into this platform's notification table:
+     - Databricks: INSERT into `ExpiryNotification_Databricks` (DeltaRequestId = id)
+     - Palantir: INSERT into `ExpiryNotification_Palantir` (PalantirRequestId = RequestId)
+  d. If email fails → DO NOT insert (only record successful sends)
 - **IMPORTANT: Each parallel task must get its own SqlConnection** (connections are not thread-safe)
 - **IMPORTANT: Each task is wrapped in its own try-catch** so one failure does NOT kill the other parallel tasks
 - Use `ConcurrentBag<object>` for collecting results (thread-safe)
-- Use `Task.WhenAll(tasks)` to run all in parallel (Databricks and Palantir notifications run together)
+- Use `Task.WhenAll(tasks)` to run all in parallel
 - Track elapsed time with Stopwatch for performance metrics
 
 **Step 5: Release the lock**
-- On success: UPDATE the NotificationJobRun row to Status = 'Completed' with total Success_Count and Failed_Count (across both platforms)
-- On crash (outer try-catch): UPDATE to Status = 'Failed' with Error_Message
+- On success: `JobRunHelper.CompleteJobAsync(connection, jobId, successCount, failedCount)`
+- On crash (outer try-catch): `JobRunHelper.FailJobAsync(connection, jobId, errorMessage)`
 
 **Step 6: Return response**
-- Include: message, jobId, notifiedCount, failedCount, list of successful notifications (with platform field), list of failed notifications (with platform field), performance metrics
+- Include: message, jobId, notifiedCount, failedCount, list of successful notifications, list of failed notifications, performance metrics
 
 ### Test simulation parameters (query string)
 - `?simulateFailures=true` → Randomly fail ~50% of emails (random.Next(2) == 0)
@@ -89,75 +101,76 @@ Finds all Active access requests expiring within 30 days from BOTH Databricks an
 
 ---
 
-## Flow 2: Revoke Expired Access Job
+## Flow 2: Revoke Expired Access Job (per-platform)
 
 ### What it does
-Finds all Active access requests where the expiry date has already passed from BOTH Databricks and Palantir tables, marks them as Revoked, and records the revocation details in the correct platform's revocation table.
+Each platform has its own revoke job (Job_Type: `RevokeExpiredDatabricks` or `RevokeExpiredPalantir`). It finds Active access requests where the expiry date has already passed from that platform's table only, marks them as Revoked, and records the revocation details in that platform's revocation table.
 
-### Step-by-step execution flow
+### Step-by-step execution flow (parameterized by platform)
 
-**Step 1: Check if another job is already running (DB-level lock)**
-- Same pattern as notification job but uses `RevokeExpiredJobRun` table instead
-- Open `lockConnection`, try atomic INSERT with NOT EXISTS
+**Step 1: Check if another job of the SAME TYPE is already running (DB-level lock)**
+- Same pattern as notification job — uses `JobRun` table with Job_Type = `"RevokeExpiredDatabricks"` or `"RevokeExpiredPalantir"`
+- Call `JobRunHelper.TryAcquireLockAsync(connection, jobId, jobType, startedBy)`
 - If lock acquired → proceed. If not → return 409 Conflict with active job details
-- Put the lock functions in a separate helper class `RevokeJobHelper.cs` (static methods) to keep Program.cs clean
+- **NOTE:** A Databricks revoke job does NOT block a Palantir revoke job or any notification job
 
 **Step 2: Artificial delay for testing**
 - `await Task.Delay(15000)` — 15 seconds so you can open a second browser tab to verify the lock works
 
-**Step 3: Find expired requests from BOTH platforms**
-- Query `DataAccessDeltaRequests` for expired Databricks requests (use appropriate status/expiry columns) → collect `id` values, tag as "Databricks"
-- Query `DataAccessPalantirRequests` for expired Palantir requests (use appropriate status/expiry columns) → collect `RequestId` values, tag as "Palantir"
+**Step 3: Find expired requests from THIS platform only**
+- For Databricks: Query `DataAccessDeltaRequests` for expired requests (use appropriate status/expiry columns) → collect `id` values
+- For Palantir: Query `DataAccessPalantirRequests` for expired requests (use appropriate status/expiry columns) → collect `RequestId` values
 - **NOTE:** The two tables have different PKs: Databricks uses `id` (INT), Palantir uses `RequestId` (UNIQUEIDENTIFIER)
 
-**Step 4: If no expired requests found in either platform**
-- Release the lock (mark as Completed with Revoked_Count = 0)
+**Step 4: If no expired requests found**
+- Release the lock (mark as Completed with Processed_Count = 0)
 - Return "No expired requests found to revoke."
 
-**Step 5: Revoke expired Databricks requests**
-- UPDATE `DataAccessDeltaRequests` SET Status = 'Revoked' WHERE expired (use appropriate columns)
-- For each Databricks expired `id` → INSERT into `RevokedAccess_Databricks` (DeltaRequestId = id) with Revoked_Dt = GETUTCDATE() and Revoked_By = 'System - Scheduled Expiry Job'
+**Step 5: Revoke expired requests**
+- For Databricks:
+  - UPDATE `DataAccessDeltaRequests` SET Status = 'Revoked' WHERE expired
+  - For each expired `id` → INSERT into `RevokedAccess_Databricks` (DeltaRequestId = id) with Revoked_Dt = GETUTCDATE() and Revoked_By = 'System - Scheduled Expiry Job'
+- For Palantir:
+  - UPDATE `DataAccessPalantirRequests` SET Status = 'Revoked' WHERE expired
+  - For each expired `RequestId` → INSERT into `RevokedAccess_Palantir` (PalantirRequestId = RequestId) with Revoked_Dt = GETUTCDATE() and Revoked_By = 'System - Scheduled Expiry Job'
 
-**Step 6: Revoke expired Palantir requests**
-- UPDATE `DataAccessPalantirRequests` SET Status = 'Revoked' WHERE expired (use appropriate columns)
-- For each Palantir expired `RequestId` → INSERT into `RevokedAccess_Palantir` (PalantirRequestId = RequestId) with Revoked_Dt = GETUTCDATE() and Revoked_By = 'System - Scheduled Expiry Job'
+**Step 6: Release the lock**
+- On success: `JobRunHelper.CompleteJobAsync(connection, jobId, revokedCount, 0)`
+- On crash: `JobRunHelper.FailJobAsync(connection, jobId, errorMessage)`
 
-**Step 7: Release the lock**
-- On success: UPDATE RevokeExpiredJobRun to Completed with total Revoked_Count (Databricks count + Palantir count)
-- On crash: UPDATE to Failed with Error_Message
-
-**Step 8: Return response**
-- message, revokedCount (total), databricksRevokedCount, palantirRevokedCount, revokedAt
+**Step 7: Return response**
+- message, revokedCount, revokedAt
 
 ---
 
-## Flow 3: Job Status Polling (Frontend)
+## Flow 3: Job Status Polling (Frontend — per-platform)
 
-### What the frontend does for BOTH jobs
+### What the frontend does for each job page
+Each platform has its own job pages, so each page polls its own platform-specific job status endpoint.
 
 **On page load:**
-1. Fetch the job status endpoint (GET /notification-job-status or GET /revoke-job-status)
+1. Fetch the platform-specific job status endpoint (e.g., GET /api/databricks/access-requests/notification-job-status)
 2. Response shape: `{ isLocked: boolean, activeJob: { jobId, startedAt, startedBy } | null }`
 3. If `isLocked = true` → Show a yellow warning banner with the active job details and disable the trigger button
 4. Start polling every 3 seconds using setInterval
-5. On each poll, if `isLocked = false` → Stop polling, clear the banner, re-enable button, refresh the data lists from both platforms
+5. On each poll, if `isLocked = false` → Stop polling, clear the banner, re-enable button, refresh the data list
 
 **When user clicks the trigger button:**
-1. POST to the job endpoint
+1. POST to the platform-specific job endpoint (e.g., POST /api/databricks/access-requests/revoke-expired)
 2. If response is 409 Conflict → Show error message with active job details, start polling
-3. If response is 200 OK → Show success result, clear job status, refresh data from both platforms
+3. If response is 200 OK → Show success result, clear job status, refresh data
 
 **Key frontend states:**
 - `jobStatus` — tracks { isLocked, activeJob }
 - `pollRef` — useRef to hold the setInterval ID (for cleanup)
-- Button disabled when: `loading || jobStatus.isLocked` (or when no data to process from either platform)
+- Button disabled when: `loading || jobStatus.isLocked` (or when no data to process)
 - Yellow banner shows: "Job is currently running — Started by {serverName} at {time}" with a hint "The button is disabled. This page will auto-refresh when the job completes."
 - Banner uses CSS animation (pulse border) to indicate it's actively polling
 
-### Platform-specific UI in shared job pages
-- The combined table shows a "Platform" column with colored badges: blue/purple for Databricks, teal/green for Palantir
-- Result counts break down by platform: "Revoked 5 request(s): 3 Databricks, 2 Palantir"
-- Each notification result item includes the platform badge
+### Reusable components
+Since all platform pages have identical logic (only the API URL and Job_Type differ), create reusable components:
+- `RevokeExpiredPage({ platform })` — used by DatabricksRevokeExpired.tsx and PalantirRevokeExpired.tsx
+- `ExpiryNotificationsPage({ platform })` — used by DatabricksExpiryNotifications.tsx and PalantirExpiryNotifications.tsx
 
 ---
 
@@ -178,14 +191,18 @@ Finds all Active access requests where the expiry date has already passed from B
 | GET | /api/databricks/access-requests/pending-expiry | Databricks expired requests from DataAccessDeltaRequests |
 | POST | /api/databricks/access-requests | Create new request in DataAccessDeltaRequests |
 | GET | /api/databricks/access-requests/pending-notifications | Databricks requests needing notification |
+| POST | /api/databricks/access-requests/send-expiry-notifications | Run Databricks notification job (Job_Type: ExpiryNotificationDatabricks) |
+| GET | /api/databricks/access-requests/notification-job-status | Check Databricks notification job lock |
+| POST | /api/databricks/access-requests/revoke-expired | Run Databricks revoke job (Job_Type: RevokeExpiredDatabricks) |
+| GET | /api/databricks/access-requests/revoke-job-status | Check Databricks revoke job lock |
 | GET | /api/palantir/access-requests | All Palantir requests (DataAccessPalantirRequests LEFT JOIN RevokedAccess_Palantir) |
 | GET | /api/palantir/access-requests/pending-expiry | Palantir expired requests from DataAccessPalantirRequests |
 | POST | /api/palantir/access-requests | Create new request in DataAccessPalantirRequests |
 | GET | /api/palantir/access-requests/pending-notifications | Palantir requests needing notification |
-| POST | /api/access-requests/send-expiry-notifications | Run notification job — processes BOTH platforms (with DB lock) |
-| GET | /api/access-requests/notification-job-status | Check notification job lock status |
-| POST | /api/access-requests/revoke-expired | Run revoke job — processes BOTH platforms (with DB lock) |
-| GET | /api/access-requests/revoke-job-status | Check revoke job lock status |
+| POST | /api/palantir/access-requests/send-expiry-notifications | Run Palantir notification job (Job_Type: ExpiryNotificationPalantir) |
+| GET | /api/palantir/access-requests/notification-job-status | Check Palantir notification job lock |
+| POST | /api/palantir/access-requests/revoke-expired | Run Palantir revoke job (Job_Type: RevokeExpiredPalantir) |
+| GET | /api/palantir/access-requests/revoke-job-status | Check Palantir revoke job lock |
 
 ---
 
@@ -193,16 +210,18 @@ Finds all Active access requests where the expiry date has already passed from B
 
 | Page | Scope | What it shows |
 |------|-------|--------------|
-| DatabricksAllRequests.tsx | Databricks only | All Databricks requests with revoked info |
-| DatabricksCreateRequest.tsx | Databricks only | Form to create Databricks request |
-| DatabricksPendingExpiry.tsx | Databricks only | Databricks active requests past expiry |
-| PalantirAllRequests.tsx | Palantir only | All Palantir requests with revoked info |
-| PalantirCreateRequest.tsx | Palantir only | Form to create Palantir request |
-| PalantirPendingExpiry.tsx | Palantir only | Palantir active requests past expiry |
-| ExpiryNotifications.tsx | BOTH platforms | Combined notifications table + trigger button with DB lock |
-| RevokeExpired.tsx | BOTH platforms | Combined expired table + revoke button with DB lock |
+| DatabricksAllRequests.tsx | Databricks | All Databricks requests with revoked info |
+| DatabricksCreateRequest.tsx | Databricks | Form to create Databricks request |
+| DatabricksPendingExpiry.tsx | Databricks | Databricks active requests past expiry |
+| DatabricksExpiryNotifications.tsx | Databricks | Databricks notifications + trigger (Job_Type: ExpiryNotificationDatabricks) |
+| DatabricksRevokeExpired.tsx | Databricks | Databricks expired + revoke button (Job_Type: RevokeExpiredDatabricks) |
+| PalantirAllRequests.tsx | Palantir | All Palantir requests with revoked info |
+| PalantirCreateRequest.tsx | Palantir | Form to create Palantir request |
+| PalantirPendingExpiry.tsx | Palantir | Palantir active requests past expiry |
+| PalantirExpiryNotifications.tsx | Palantir | Palantir notifications + trigger (Job_Type: ExpiryNotificationPalantir) |
+| PalantirRevokeExpired.tsx | Palantir | Palantir expired + revoke button (Job_Type: RevokeExpiredPalantir) |
 
-Consider making reusable components (e.g., `AllRequestsPage({ platform })`, `CreateRequestPage({ platform })`) since the Databricks and Palantir pages have identical logic — only the API URL differs.
+All pages are platform-specific. Consider making reusable components (e.g., `AllRequestsPage({ platform })`, `RevokeExpiredPage({ platform })`, `ExpiryNotificationsPage({ platform })`) since the Databricks and Palantir pages have identical logic — only the API URL differs.
 
 ---
 

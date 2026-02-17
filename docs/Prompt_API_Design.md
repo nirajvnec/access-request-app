@@ -20,9 +20,10 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 - `RevokedAccess_Databricks` — Id, DeltaRequestId (FK → DataAccessDeltaRequests.id), Revoked_Dt, Revoked_By
 - `RevokedAccess_Palantir` — Id, PalantirRequestId (FK → DataAccessPalantirRequests.RequestId), Revoked_Dt, Revoked_By
 
-**Shared (one table for both platforms):**
-- `NotificationJobRun` — Job_Id, Status, Started_At, Started_By, Completed_At, Success_Count, Failed_Count, Error_Message
-- `RevokeExpiredJobRun` — Job_Id, Status, Started_At, Started_By, Completed_At, Revoked_Count, Error_Message
+**Unified job run table (single table for ALL jobs):**
+- `JobRun` — Job_Id, Job_Type, Status, Started_At, Started_By, Completed_At, Processed_Count, Failed_Count, Error_Message
+- Job_Type values: `RevokeExpiredDatabricks`, `RevokeExpiredPalantir`, `ExpiryNotificationDatabricks`, `ExpiryNotificationPalantir`
+- Each job type's lock is independent — filtering by Job_Type means all 4 jobs can run in parallel
 
 ---
 
@@ -35,17 +36,17 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 
 ### Helper Classes (in Helpers/ folder)
 
-**NotificationJobHelper.cs** — Static class with 4 methods for DB-level locking on the NotificationJobRun table:
-1. `TryAcquireLockAsync(SqlConnection, Guid jobId, string startedBy)` → bool
-2. `GetActiveJobInfoAsync(SqlConnection)` → object?
-3. `CompleteJobAsync(SqlConnection, Guid jobId, int successCount, int failedCount)` → void
+**JobRunHelper.cs** — Single static class with 4 methods for DB-level locking on the unified `JobRun` table. All methods take a `jobType` parameter to scope the lock to a specific job type:
+1. `TryAcquireLockAsync(SqlConnection, Guid jobId, string jobType, string startedBy)` → bool — INSERT with NOT EXISTS filtered by jobType
+2. `GetActiveJobInfoAsync(SqlConnection, string jobType)` → object? — Returns active job info for this job type only
+3. `CompleteJobAsync(SqlConnection, Guid jobId, int processedCount, int failedCount)` → void
 4. `FailJobAsync(SqlConnection, Guid jobId, string errorMessage)` → void
 
-**RevokeJobHelper.cs** — Static class with 4 methods for DB-level locking on the RevokeExpiredJobRun table:
-1. `TryAcquireLockAsync(SqlConnection, Guid jobId, string startedBy)` → bool
-2. `GetActiveJobInfoAsync(SqlConnection)` → object?
-3. `CompleteJobAsync(SqlConnection, Guid jobId, int revokedCount)` → void
-4. `FailJobAsync(SqlConnection, Guid jobId, string errorMessage)` → void
+**Job type constants** (use as the `jobType` parameter):
+- `"RevokeExpiredDatabricks"`
+- `"RevokeExpiredPalantir"`
+- `"ExpiryNotificationDatabricks"`
+- `"ExpiryNotificationPalantir"`
 
 ### Notification-specific helper functions (in Program.cs or a separate helper file)
 
@@ -103,33 +104,46 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 **GET /api/palantir/access-requests/pending-notifications**
 - Calls FindRequestsPendingNotificationAsync with platform = "Palantir"
 
-### Shared Job Endpoints (process BOTH platforms in one job run)
+### Databricks Job Endpoints (each job is platform-specific, uses JobRun table with Job_Type)
 
-**POST /api/access-requests/send-expiry-notifications** (with DB lock)
+**POST /api/databricks/access-requests/send-expiry-notifications** (with DB lock, Job_Type = "ExpiryNotificationDatabricks")
 - Query params: ?simulateFailures=true, ?failEmail=email1&failEmail=email2
-- Step 1: Acquire lock via NotificationJobHelper.TryAcquireLockAsync → 409 if locked
-- Step 2: Call FindRequestsPendingNotificationAsync TWICE — once for "Databricks", once for "Palantir". Merge the results into a single list (each item carries its platform).
-- Step 3: FilterRequestsNeedingNotification on the merged list
-- Step 4: ProcessNotificationsInParallelAsync — sends all in parallel, each notification inserts into the correct platform table based on the platform field
-- Step 5: CompleteJobAsync with total success/failure counts across both platforms
+- Step 1: Acquire lock via JobRunHelper.TryAcquireLockAsync with jobType = "ExpiryNotificationDatabricks" → 409 if locked
+- Step 2: Call FindRequestsPendingNotificationAsync for "Databricks" only
+- Step 3: FilterRequestsNeedingNotification
+- Step 4: ProcessNotificationsInParallelAsync — inserts into ExpiryNotification_Databricks
+- Step 5: CompleteJobAsync with success/failure counts
 - Response includes: message, jobId, notifiedCount, failedCount, requests[], failed[], performance metrics
 
-**GET /api/access-requests/notification-job-status**
+**GET /api/databricks/access-requests/notification-job-status**
+- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "ExpiryNotificationDatabricks"
 - Returns { isLocked: bool, activeJob: { jobId, startedAt, startedBy } | null }
 
-**POST /api/access-requests/revoke-expired** (with DB lock)
-- Step 1: Acquire lock via RevokeJobHelper.TryAcquireLockAsync → 409 if locked
+**POST /api/databricks/access-requests/revoke-expired** (with DB lock, Job_Type = "RevokeExpiredDatabricks")
+- Step 1: Acquire lock via JobRunHelper.TryAcquireLockAsync with jobType = "RevokeExpiredDatabricks" → 409 if locked
 - Step 2: Task.Delay(15000ms) artificial delay for testing
-- Step 3: Find expired requests from BOTH tables:
-  - Query `DataAccessDeltaRequests` for expired Databricks requests (use appropriate expiry/status columns)
-  - Query `DataAccessPalantirRequests` for expired Palantir requests (use appropriate expiry/status columns)
-- Step 4: For Databricks expired: UPDATE status in `DataAccessDeltaRequests`, INSERT into `RevokedAccess_Databricks` (DeltaRequestId = id)
-- Step 5: For Palantir expired: UPDATE status in `DataAccessPalantirRequests`, INSERT into `RevokedAccess_Palantir` (PalantirRequestId = RequestId)
-- Step 6: CompleteJobAsync with total revoked count (Databricks + Palantir)
+- Step 3: Find expired requests from `DataAccessDeltaRequests` only
+- Step 4: UPDATE status in `DataAccessDeltaRequests`, INSERT into `RevokedAccess_Databricks` (DeltaRequestId = id)
+- Step 5: CompleteJobAsync with revoked count
 - Outer try-catch: FailJobAsync on crash
 
-**GET /api/access-requests/revoke-job-status**
+**GET /api/databricks/access-requests/revoke-job-status**
+- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "RevokeExpiredDatabricks"
 - Returns { isLocked: bool, activeJob: { jobId, startedAt, startedBy } | null }
+
+### Palantir Job Endpoints (same pattern, different Job_Type and tables)
+
+**POST /api/palantir/access-requests/send-expiry-notifications** (with DB lock, Job_Type = "ExpiryNotificationPalantir")
+- Same flow as Databricks but queries `DataAccessPalantirRequests`, inserts into `ExpiryNotification_Palantir`
+
+**GET /api/palantir/access-requests/notification-job-status**
+- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "ExpiryNotificationPalantir"
+
+**POST /api/palantir/access-requests/revoke-expired** (with DB lock, Job_Type = "RevokeExpiredPalantir")
+- Same flow as Databricks but queries `DataAccessPalantirRequests`, inserts into `RevokedAccess_Palantir` (PalantirRequestId = RequestId)
+
+**GET /api/palantir/access-requests/revoke-job-status**
+- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "RevokeExpiredPalantir"
 
 ---
 
@@ -154,8 +168,10 @@ The app should have a sidebar or tab navigation that lets the user switch betwee
 - All Requests
 - Create Request
 - Pending Expiry
+- Expiry Notifications (platform-specific job)
+- Revoke Expired (platform-specific job)
 
-The job pages (Expiry Notifications, Revoke Expired) are shared — they show data from BOTH platforms and process both in a single job.
+All jobs are now platform-specific — each platform runs its own independent job with its own lock (via Job_Type in the JobRun table).
 
 ### DatabricksAllRequests.tsx / PalantirAllRequests.tsx
 - Same component logic, different API endpoint (/api/databricks/... vs /api/palantir/...)
@@ -169,21 +185,23 @@ The job pages (Expiry Notifications, Revoke Expired) are shared — they show da
 ### DatabricksPendingExpiry.tsx / PalantirPendingExpiry.tsx
 - Same component logic, different API endpoint
 
-### RevokeExpired.tsx (SHARED — processes both platforms)
-- Fetches expired requests from BOTH /api/databricks/access-requests/pending-expiry AND /api/palantir/access-requests/pending-expiry
-- Shows a combined table with an extra "Platform" column showing "Databricks" or "Palantir" badge
-- Shows count: "5 Expired Request(s) Found (3 Databricks, 2 Palantir)"
-- Button: "Run Revoke Job (5)" — triggers the shared /api/access-requests/revoke-expired endpoint
-- DB lock with polling on /api/access-requests/revoke-job-status
-- After job completes: refreshes both lists
+### DatabricksRevokeExpired.tsx / PalantirRevokeExpired.tsx
+- Same component logic, different API endpoints (/api/databricks/... vs /api/palantir/...)
+- Fetches expired requests from its own platform's pending-expiry endpoint
+- Shows count: "3 Expired Request(s) Found"
+- Button: "Run Revoke Job (3)" — triggers the platform's own revoke-expired endpoint
+- DB lock with polling on the platform's own revoke-job-status endpoint
+- Each platform's revoke job runs independently — Databricks revoke does NOT block Palantir revoke
+- Consider a reusable `RevokeExpiredPage` component with `platform` prop
 
-### ExpiryNotifications.tsx (SHARED — processes both platforms)
-- Fetches pending notifications from BOTH /api/databricks/access-requests/pending-notifications AND /api/palantir/access-requests/pending-notifications
-- Shows a combined table with "Platform" column
+### DatabricksExpiryNotifications.tsx / PalantirExpiryNotifications.tsx
+- Same component logic, different API endpoints
+- Fetches pending notifications from its own platform's pending-notifications endpoint
 - Test Mode UI: radio buttons (Normal, Random failures, Pick emails to fail)
-- Button: "Trigger Notification to All (N)" — triggers the shared /api/access-requests/send-expiry-notifications
-- DB lock with polling on /api/access-requests/notification-job-status
-- Results display with platform badges on each notification result
+- Button: "Trigger Notification to All (N)" — triggers the platform's own send-expiry-notifications endpoint
+- DB lock with polling on the platform's own notification-job-status endpoint
+- Each platform's notification job runs independently
+- Consider a reusable `ExpiryNotificationsPage` component with `platform` prop
 
 ### Shared CSS patterns:
 - `.job-locked-banner` — Yellow border with pulse animation

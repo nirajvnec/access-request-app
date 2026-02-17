@@ -1,6 +1,6 @@
 # Database Design Prompt
 
-I have an Access Request Management System with Azure SQL. There are two platforms — **Databricks** and **Palantir** — each with their own set of tables for access requests, notifications, and revocations. The job run tables are shared across both platforms.
+I have an Access Request Management System with Azure SQL. There are two platforms — **Databricks** and **Palantir** — each with their own set of tables for access requests, notifications, and revocations. There is a single unified `JobRun` table that tracks all job executions across both platforms using a `Job_Type` column.
 
 ---
 
@@ -48,45 +48,61 @@ I have an Access Request Management System with Azure SQL. There are two platfor
 
 ---
 
-## Shared Job Run Tables (one set shared across both platforms)
+## Unified Job Run Table
 
-### 7. NotificationJobRun — DB-level locking for the notification sending job
-When the notification job runs, it processes BOTH Databricks and Palantir requests in a single job run. It queries both UserAccessRequest_Databricks and UserAccessRequest_Palantir, and inserts notifications into the respective ExpiryNotification_Databricks or ExpiryNotification_Palantir table.
+### 7. JobRun — Single table for DB-level locking across ALL job types (NEW — CREATE THIS)
+Instead of separate tables per job, this single table uses a `Job_Type` column to distinguish between different jobs. Each job type's lock is independent — the NOT EXISTS check filters by Job_Type, so all 4 job types can run in parallel without blocking each other.
 - Id (INT, IDENTITY, PK)
 - Job_Id (UNIQUEIDENTIFIER, NOT NULL)
+- Job_Type (VARCHAR(50), NOT NULL) — see values below
 - Status (VARCHAR(20), NOT NULL) — values: 'InProgress', 'Completed', 'Failed'
 - Started_At (DATETIME, NOT NULL)
 - Started_By (VARCHAR(100), NOT NULL) — stores Environment.MachineName
 - Completed_At (DATETIME, NULL)
-- Success_Count (INT, NULL)
-- Failed_Count (INT, NULL)
+- Processed_Count (INT, NULL) — number of items processed (revoked count, notification success count, etc.)
+- Failed_Count (INT, NULL) — number of items that failed (used by notification jobs)
 - Error_Message (VARCHAR(500), NULL)
 
-### 8. RevokeExpiredJobRun — DB-level locking for the revoke expired access job
-When the revoke job runs, it processes BOTH platforms in a single job run. It finds expired requests from both UserAccessRequest_Databricks and UserAccessRequest_Palantir, updates their status, and inserts into the respective RevokedAccess_Databricks or RevokedAccess_Palantir table.
-- Id (INT, IDENTITY, PK)
-- Job_Id (UNIQUEIDENTIFIER, NOT NULL)
-- Status (VARCHAR(20), NOT NULL) — values: 'InProgress', 'Completed', 'Failed'
-- Started_At (DATETIME, NOT NULL)
-- Started_By (VARCHAR(100), NOT NULL)
-- Completed_At (DATETIME, NULL)
-- Revoked_Count (INT, NULL)
-- Error_Message (VARCHAR(500), NULL)
+### Job_Type values (4 types):
+| Job_Type | Description |
+|----------|-------------|
+| `RevokeExpiredDatabricks` | Revokes expired access from DataAccessDeltaRequests, inserts into RevokedAccess_Databricks |
+| `RevokeExpiredPalantir` | Revokes expired access from DataAccessPalantirRequests, inserts into RevokedAccess_Palantir |
+| `ExpiryNotificationDatabricks` | Sends expiry notifications for DataAccessDeltaRequests, inserts into ExpiryNotification_Databricks |
+| `ExpiryNotificationPalantir` | Sends expiry notifications for DataAccessPalantirRequests, inserts into ExpiryNotification_Palantir |
+
+### Why one table works for all 4 jobs:
+- The lock query filters by `Job_Type`, so each job type is locked independently
+- Running `RevokeExpiredDatabricks` does NOT block `RevokeExpiredPalantir` or any notification job
+- All 4 jobs can run simultaneously — each only checks for InProgress rows matching its own Job_Type
+- Simpler codebase: one helper class, one table, one set of queries parameterized by Job_Type
 
 ---
 
-## Locking pattern for both job run tables
-- Before a job runs, it does an atomic INSERT with a NOT EXISTS check: only insert an 'InProgress' row if no other InProgress row exists that is less than 10 minutes old (stale job timeout for crashed processes).
+## Locking pattern (same for all 4 job types, parameterized by Job_Type)
+- Before a job runs, it does an atomic INSERT with a NOT EXISTS check: only insert an 'InProgress' row if no other InProgress row **with the same Job_Type** exists that is less than 10 minutes old (stale job timeout for crashed processes).
+- SQL pattern:
+  ```sql
+  INSERT INTO JobRun (Job_Id, Job_Type, Status, Started_At, Started_By)
+  SELECT @JobId, @JobType, 'InProgress', GETUTCDATE(), @StartedBy
+  WHERE NOT EXISTS (
+      SELECT 1 FROM JobRun
+      WHERE Job_Type = @JobType
+        AND Status = 'InProgress'
+        AND DATEDIFF(MINUTE, Started_At, GETUTCDATE()) <= 10
+  )
+  ```
 - If the INSERT succeeds (rowsAffected > 0), the lock is acquired and the job proceeds.
-- If it fails (rowsAffected = 0), another job is already running — return HTTP 409 Conflict with active job details.
+- If it fails (rowsAffected = 0), another job of the **same type** is already running — return HTTP 409 Conflict with active job details.
 - When the job finishes, UPDATE the row to 'Completed' or 'Failed' with counts/error message.
 - This works across multiple servers because the lock lives in the database, not in-memory.
+- Jobs of **different types** never block each other — all 4 can run in parallel.
 
 ## Relationships
 - ExpiryNotification_Databricks.DeltaRequestId → DataAccessDeltaRequests.id (FK)
 - ExpiryNotification_Palantir.PalantirRequestId → DataAccessPalantirRequests.RequestId (FK)
 - RevokedAccess_Databricks.DeltaRequestId → DataAccessDeltaRequests.id (FK)
 - RevokedAccess_Palantir.PalantirRequestId → DataAccessPalantirRequests.RequestId (FK)
-- NotificationJobRun and RevokeExpiredJobRun are standalone (no FK relationships)
+- JobRun is standalone (no FK relationships) — uses Job_Type column to distinguish between the 4 job types
 
-Please generate the CREATE TABLE SQL scripts for the 6 NEW tables ONLY (do NOT create DataAccessDeltaRequests or DataAccessPalantirRequests — they already exist). Order: child tables first (ExpiryNotification, RevokedAccess), then standalone job tables.
+Please generate the CREATE TABLE SQL scripts for the 5 NEW tables ONLY (do NOT create DataAccessDeltaRequests or DataAccessPalantirRequests — they already exist). Order: child tables first (ExpiryNotification, RevokedAccess), then the JobRun table.
