@@ -66,14 +66,14 @@ Instead of separate tables per job, this single table uses a `Job_Type` column t
 ### Job_Type values (4 types):
 | Job_Type | Description |
 |----------|-------------|
-| `RevokeExpiredDatabricks` | Revokes expired access from DataAccessDeltaRequests, inserts into RevokedAccess_Databricks |
-| `RevokeExpiredPalantir` | Revokes expired access from DataAccessPalantirRequests, inserts into RevokedAccess_Palantir |
-| `ExpiryNotificationDatabricks` | Sends expiry notifications for DataAccessDeltaRequests, inserts into ExpiryNotification_Databricks |
-| `ExpiryNotificationPalantir` | Sends expiry notifications for DataAccessPalantirRequests, inserts into ExpiryNotification_Palantir |
+| `RevokeExpiredDatabricksRequests` | Revokes expired access from DataAccessDeltaRequests, inserts into RevokedAccess_Databricks |
+| `RevokeExpiredPalantirRequests` | Revokes expired access from DataAccessPalantirRequests, inserts into RevokedAccess_Palantir |
+| `ExpiryNotificationDatabricksRequests` | Sends expiry notifications for DataAccessDeltaRequests, inserts into ExpiryNotification_Databricks |
+| `ExpiryNotificationPalantirRequests` | Sends expiry notifications for DataAccessPalantirRequests, inserts into ExpiryNotification_Palantir |
 
 ### Why one table works for all 4 jobs:
 - The lock query filters by `Job_Type`, so each job type is locked independently
-- Running `RevokeExpiredDatabricks` does NOT block `RevokeExpiredPalantir` or any notification job
+- Running `RevokeExpiredDatabricksRequests` does NOT block `RevokeExpiredPalantirRequests` or any notification job
 - All 4 jobs can run simultaneously — each only checks for InProgress rows matching its own Job_Type
 - Simpler codebase: one helper class, one table, one set of queries parameterized by Job_Type
 

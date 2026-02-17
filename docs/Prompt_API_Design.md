@@ -22,7 +22,7 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 
 **Unified job run table (single table for ALL jobs):**
 - `JobRun` — Job_Id, Job_Type, Status, Started_At, Started_By, Completed_At, Processed_Count, Failed_Count, Error_Message
-- Job_Type values: `RevokeExpiredDatabricks`, `RevokeExpiredPalantir`, `ExpiryNotificationDatabricks`, `ExpiryNotificationPalantir`
+- Job_Type values: `RevokeExpiredDatabricksRequests`, `RevokeExpiredPalantirRequests`, `ExpiryNotificationDatabricksRequests`, `ExpiryNotificationPalantirRequests`
 - Each job type's lock is independent — filtering by Job_Type means all 4 jobs can run in parallel
 
 ---
@@ -43,10 +43,10 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 4. `FailJobAsync(SqlConnection, Guid jobId, string errorMessage)` → void
 
 **Job type constants** (use as the `jobType` parameter):
-- `"RevokeExpiredDatabricks"`
-- `"RevokeExpiredPalantir"`
-- `"ExpiryNotificationDatabricks"`
-- `"ExpiryNotificationPalantir"`
+- `"RevokeExpiredDatabricksRequests"`
+- `"RevokeExpiredPalantirRequests"`
+- `"ExpiryNotificationDatabricksRequests"`
+- `"ExpiryNotificationPalantirRequests"`
 
 ### Notification-specific helper functions (in Program.cs or a separate helper file)
 
@@ -106,9 +106,9 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 
 ### Databricks Job Endpoints (each job is platform-specific, uses JobRun table with Job_Type)
 
-**POST /api/databricks/access-requests/send-expiry-notifications** (with DB lock, Job_Type = "ExpiryNotificationDatabricks")
+**POST /api/databricks/access-requests/send-expiry-notifications** (with DB lock, Job_Type = "ExpiryNotificationDatabricksRequests")
 - Query params: ?simulateFailures=true, ?failEmail=email1&failEmail=email2
-- Step 1: Acquire lock via JobRunHelper.TryAcquireLockAsync with jobType = "ExpiryNotificationDatabricks" → 409 if locked
+- Step 1: Acquire lock via JobRunHelper.TryAcquireLockAsync with jobType = "ExpiryNotificationDatabricksRequests" → 409 if locked
 - Step 2: Call FindRequestsPendingNotificationAsync for "Databricks" only
 - Step 3: FilterRequestsNeedingNotification
 - Step 4: ProcessNotificationsInParallelAsync — inserts into ExpiryNotification_Databricks
@@ -116,11 +116,11 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 - Response includes: message, jobId, notifiedCount, failedCount, requests[], failed[], performance metrics
 
 **GET /api/databricks/access-requests/notification-job-status**
-- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "ExpiryNotificationDatabricks"
+- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "ExpiryNotificationDatabricksRequests"
 - Returns { isLocked: bool, activeJob: { jobId, startedAt, startedBy } | null }
 
-**POST /api/databricks/access-requests/revoke-expired** (with DB lock, Job_Type = "RevokeExpiredDatabricks")
-- Step 1: Acquire lock via JobRunHelper.TryAcquireLockAsync with jobType = "RevokeExpiredDatabricks" → 409 if locked
+**POST /api/databricks/access-requests/revoke-expired** (with DB lock, Job_Type = "RevokeExpiredDatabricksRequests")
+- Step 1: Acquire lock via JobRunHelper.TryAcquireLockAsync with jobType = "RevokeExpiredDatabricksRequests" → 409 if locked
 - Step 2: Task.Delay(15000ms) artificial delay for testing
 - Step 3: Find expired requests from `DataAccessDeltaRequests` only
 - Step 4: UPDATE status in `DataAccessDeltaRequests`, INSERT into `RevokedAccess_Databricks` (DeltaRequestId = id)
@@ -128,22 +128,22 @@ I have an ASP.NET Core Minimal API (C#) with React 19 + TypeScript frontend for 
 - Outer try-catch: FailJobAsync on crash
 
 **GET /api/databricks/access-requests/revoke-job-status**
-- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "RevokeExpiredDatabricks"
+- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "RevokeExpiredDatabricksRequests"
 - Returns { isLocked: bool, activeJob: { jobId, startedAt, startedBy } | null }
 
 ### Palantir Job Endpoints (same pattern, different Job_Type and tables)
 
-**POST /api/palantir/access-requests/send-expiry-notifications** (with DB lock, Job_Type = "ExpiryNotificationPalantir")
+**POST /api/palantir/access-requests/send-expiry-notifications** (with DB lock, Job_Type = "ExpiryNotificationPalantirRequests")
 - Same flow as Databricks but queries `DataAccessPalantirRequests`, inserts into `ExpiryNotification_Palantir`
 
 **GET /api/palantir/access-requests/notification-job-status**
-- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "ExpiryNotificationPalantir"
+- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "ExpiryNotificationPalantirRequests"
 
-**POST /api/palantir/access-requests/revoke-expired** (with DB lock, Job_Type = "RevokeExpiredPalantir")
+**POST /api/palantir/access-requests/revoke-expired** (with DB lock, Job_Type = "RevokeExpiredPalantirRequests")
 - Same flow as Databricks but queries `DataAccessPalantirRequests`, inserts into `RevokedAccess_Palantir` (PalantirRequestId = RequestId)
 
 **GET /api/palantir/access-requests/revoke-job-status**
-- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "RevokeExpiredPalantir"
+- Calls JobRunHelper.GetActiveJobInfoAsync with jobType = "RevokeExpiredPalantirRequests"
 
 ---
 
